@@ -2,9 +2,9 @@
 Using LEDs to display stock tickers
 
 Hardware required:
-Raspberry Pi
-WS2812B RGB LED Boards
-5V Power Supply
+- Raspberry Pi
+- WS2812B RGB LED Boards
+- 5V Power Supply
 
 Connections:
 - Raspberry Pi data connects to GPIO 18 which will be the data pin to the LED boards
