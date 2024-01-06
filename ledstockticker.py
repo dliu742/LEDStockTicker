@@ -655,22 +655,29 @@ def bottomPriceLEDSectionMatrix(price):
     return paddedTextMatrix
 
 
-def middleGraphLEDSectionMatrix():
-    return np.zeros((ledMiddleSectionHeight, ledWidth), dtype=int)
+def colorMatrix(height, width, color):
+    return np.full((height, width), color)
 
 
 def addTopMiddleBottomMatrix(top, middle, bottom):
     return np.concatenate((top, middle, bottom), axis=0)
 
 
-def ledToTurnOnList(ticker, price):
+def ledToTurnOnList(ticker, price, priceHistory, ytdPrice):
     top = topTickerLEDSectionMatrix(ticker)
-    middle = middleGraphLEDSectionMatrix()
+    middle, middleColor = ledPriceBlock(priceHistory, ytdPrice)
     bottom = bottomPriceLEDSectionMatrix(price)
     matrix = addTopMiddleBottomMatrix(top, middle, bottom)
     maskedOnLEDMatrixed = numpy.multiply(ledMappingMatrix, matrix)
     flattenedOnLEDList = maskedOnLEDMatrixed.flatten()
-    return flattenedOnLEDList[flattenedOnLEDList != 0]
+
+    topColor = colorMatrix(ledTopSectionHeight, ledWidth, "white")
+    bottomColor = colorMatrix(ledBottomSectionHeight, ledWidth, "white")
+    matrixColor = addTopMiddleBottomMatrix(topColor, middleColor, bottomColor)
+    flattenedColorLEDList = matrixColor.flatten()
+
+    ledOnLEDColorArray = np.stack((flattenedOnLEDList, flattenedColorLEDList), axis=1)
+    return ledOnLEDColorArray
 
 
 ###########################################################################################
@@ -684,22 +691,23 @@ def colorWipe(strip, color, wait_ms=10):
         time.sleep(wait_ms / 1000.0)
 
 
-def showInputList(strip, input_list, color, wait_ms=5000):
-    if color == 'green':
-        colorInput = Color(0, 255, 0)
-    elif color == 'red':
-        colorInput = Color(255, 0, 0)
-    else:
-        colorInput = Color(255, 255, 255) #white
-
+def showInputList(strip, input_list, wait_ms=5000):
     ledOFF = Color(0, 0, 0) #black
 
     for i in input_list:
-        strip.setPixelColor(i.item(), colorInput)
+        if i[1] == 'green':
+            colorInput = Color(0, 255, 0)
+        elif i[1] == 'red':
+            colorInput = Color(255, 0, 0)
+        elif i[1] == 'white':
+            colorInput = Color(255, 255, 255)  # white
+        else:
+            colorInput = Color(0, 0, 0)  # black
+        strip.setPixelColor(int(i[0].item()), int(colorInput))
     strip.show()
     time.sleep(wait_ms / 1000.0)
     for i in input_list:
-        strip.setPixelColor(i.item(), ledOFF)
+        strip.setPixelColor(int(i[0].item()), int(ledOFF))
     strip.show()
 
 
@@ -792,7 +800,68 @@ def yfianceData(symbol):
     ticker_price_change = round(price_change, 2)
     ticker_price_change_percentage = round(percentage_change, 2)
 
-    return ticker_current_price, ticker_price_change_percentage, color_logic
+    return ticker_current_price, ticker_price_change_percentage, color_logic, price_history, ytd_closing_price
+
+
+def priceProcessing(price):
+    priceDataArrayLength = len(price)
+    if priceDataArrayLength / ledWidth <= 1:
+        return price
+    else:
+        price = np.array(price)
+        excludedPrice = priceDataArrayLength % ledWidth #to prevent overflow
+        includedPrice = price[:(priceDataArrayLength - excludedPrice)]
+        consecutiveAverage = len(includedPrice) / ledWidth
+        avgResult = np.average(includedPrice.reshape(-1, int(consecutiveAverage)), axis=1)
+        return avgResult
+
+
+def ledPriceBlock(price, ytdPrice):
+    price = priceProcessing(price)
+    totalDataList = np.append(price, ytdPrice)
+    priceMax = max(totalDataList)
+    priceMin = min(totalDataList)
+    blockDivision = (priceMax - priceMin) / ledMiddleSectionHeight
+    ledPrice = []
+    for i in range(len(price)):
+        priceLEDLocation = round((price[i] - priceMin) / blockDivision, 0)
+        ledPrice.append(int(priceLEDLocation))
+
+    ytdPriceLEDLocation = round((ytdPrice - priceMin) / blockDivision, 0)
+
+    ledOnLocationBlock = []
+    ledColorLocationBlock = []
+    for i in range(len(ledPrice)):
+        ledYOnLocationBlock = []
+        ledYColorLocationBlock = []
+        for y in range(ledMiddleSectionHeight):
+            if y < ledPrice[i] and y < ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(0)
+                ledYColorLocationBlock.append("black")
+            elif y > ledPrice[i] and y <= ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(1)
+                ledYColorLocationBlock.append("red")
+            elif y == ledPrice[i] and y < ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(1)
+                ledYColorLocationBlock.append("red")
+            elif y < ledPrice[i] and y >= ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(1)
+                ledYColorLocationBlock.append("green")
+            elif y == ledPrice[i] and y > ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(1)
+                ledYColorLocationBlock.append("green")
+            elif y == ledPrice[i] and y == ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(1)
+                ledYColorLocationBlock.append("white")
+            elif y > ledPrice[i] and y > ytdPriceLEDLocation:
+                ledYOnLocationBlock.append(0)
+                ledYColorLocationBlock.append("black")
+        ledOnLocationBlock.append(ledYOnLocationBlock)
+        ledColorLocationBlock.append(ledYColorLocationBlock)
+
+    rotatedLEDOnLocationBlock = np.rot90(ledOnLocationBlock)
+    rotatedLEDColorLocationBlock = np.rot90(ledColorLocationBlock)
+    return rotatedLEDOnLocationBlock, rotatedLEDColorLocationBlock
 
 
 # obtain ticker from csv file
@@ -821,16 +890,19 @@ if __name__ == '__main__':
         print('Use "-c" argument to clear LEDs on exit')
 
     try:
+
         while True:
             print("List of Tickers")
             for ticker in selected_ticker:
-                (tickerPrice, tickerPriceChangePercentage, color_logic) = yfianceData(ticker)
+                (tickerPrice, tickerPriceChangePercentage, color_logic, priceHistory, yesterdayClosingPrice) = yfianceData(ticker)
                 tickerData = 'Ticker: {}, Price: {}, Change%: {}'.format(ticker,
                                                                          tickerPrice,
                                                                          round(tickerPriceChangePercentage, 2))
                 print(tickerData)
-                showInputList(strip, ledToTurnOnList(ticker, tickerPrice), color_logic)
+                ledList = ledToTurnOnList(ticker, tickerPrice, priceHistory["Close"], yesterdayClosingPrice)
+                showInputList(strip, ledList)
 
     except KeyboardInterrupt:
         if args.clear:
             colorWipe(strip, Color(0, 0, 0), 10)
+
