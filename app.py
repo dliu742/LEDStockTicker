@@ -1,6 +1,7 @@
 import time
 import threading
 import argparse
+import traceback
 import numpy as np
 import pandas as pd
 import pytz
@@ -112,7 +113,10 @@ state = {
     "mode": "time_weather", 
     "color": [255, 255, 255],
     "brightness": 15,
-    "tickers": ["AAPL", "MSFT"]
+    "tickers": ["AAPL", "MSFT"],
+    "rainbow_colors": [[255, 0, 0], [255, 140, 0], [255, 255, 0], [0, 200, 0], [0, 100, 255], [140, 0, 255]],
+    "rainbow_pattern": "wave",   # "wave" (scrolls across the panel) or "cycle" (whole panel fades through the list)
+    "rainbow_speed": 5           # 1 (slow) - 10 (fast)
 }
 
 # --- 4. FLASK WEB SERVER SETUP ---
@@ -134,6 +138,8 @@ HTML_TEMPLATE = """
         button { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; background: #555; color: white; margin-right: 5px; }
         button:hover { background: #777; }
         .mode-btn.active { background: #007bff; }
+        .power-btn.active-on { background: #28a745; box-shadow: 0 0 0 2px #7be396; }
+        .power-btn.active-off { background: #dc3545; box-shadow: 0 0 0 2px #ff8a94; }
         #ticker-list { list-style: none; padding: 0; }
         #ticker-list li { background: #444; padding: 5px; margin-bottom: 5px; display: flex; justify-content: space-between;}
     </style>
@@ -143,8 +149,8 @@ HTML_TEMPLATE = """
         <h1>Matrix Controller</h1>
         
         <div class="control-group">
-            <button onclick="togglePower(true)">Turn ON</button>
-            <button onclick="togglePower(false)" style="background:#dc3545;">Turn OFF</button>
+            <button class="power-btn" id="btn_power_on" onclick="togglePower(true)">Turn ON</button>
+            <button class="power-btn" id="btn_power_off" onclick="togglePower(false)">Turn OFF</button>
         </div>
 
         <div class="control-group">
@@ -152,11 +158,17 @@ HTML_TEMPLATE = """
             <button class="mode-btn" id="btn_light_panel" onclick="setMode('light_panel')">Light Panel</button>
             <button class="mode-btn" id="btn_time_weather" onclick="setMode('time_weather')">Time & Weather</button>
             <button class="mode-btn" id="btn_stock_trading" onclick="setMode('stock_trading')">Stock Trading</button>
+            <button class="mode-btn" id="btn_rainbow" onclick="setMode('rainbow')">Rainbow</button>
         </div>
 
         <div class="control-group">
             <label>Brightness</label>
-            <input type="range" id="brightness" min="0" max="255" value="15" onchange="updateState()">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <button onclick="stepBrightness(-1)" style="padding:5px 12px;">&#9660;</button>
+                <input type="range" id="brightness" min="0" max="255" value="15" oninput="document.getElementById('brightnessValue').textContent = this.value" onchange="updateState()" style="flex:1;">
+                <button onclick="stepBrightness(1)" style="padding:5px 12px;">&#9650;</button>
+                <span id="brightnessValue" style="min-width:2.5em; text-align:right; font-weight:bold;">15</span>
+            </div>
         </div>
 
         <div class="control-group">
@@ -170,6 +182,31 @@ HTML_TEMPLATE = """
             <button onclick="addTicker()">Add</button>
             <ul id="ticker-list"></ul>
         </div>
+
+        <div class="control-group">
+            <label>Rainbow Settings</label>
+
+            <div style="margin-bottom:0.75rem;">
+                <label style="font-weight:normal; margin-bottom:0.25rem;">Pattern</label>
+                <select id="rainbowPattern" onchange="updateRainbowSettings()" style="width:100%; padding:6px;">
+                    <option value="wave">Scrolling Wave (colors sweep across the panel)</option>
+                    <option value="cycle">Color Cycle (whole panel fades through the list)</option>
+                </select>
+            </div>
+
+            <div style="margin-bottom:0.75rem;">
+                <label style="font-weight:normal; margin-bottom:0.25rem;">Speed</label>
+                <input type="range" id="rainbowSpeed" min="1" max="10" value="5" oninput="document.getElementById('rainbowSpeedValue').textContent = this.value" onchange="updateRainbowSettings()">
+                <span id="rainbowSpeedValue">5</span>
+            </div>
+
+            <div>
+                <label style="font-weight:normal; margin-bottom:0.25rem;">Colors (in scroll/cycle order)</label>
+                <input type="color" id="newRainbowColor" value="#ff0000" style="width:60px; height:35px; vertical-align:middle;">
+                <button onclick="addRainbowColor()">Add Color</button>
+                <ul id="rainbow-color-list"></ul>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -178,7 +215,10 @@ HTML_TEMPLATE = """
             mode: "light_panel",
             color: [255, 255, 255],
             brightness: 15,
-            tickers: ["AAPL", "MSFT"]
+            tickers: ["AAPL", "MSFT"],
+            rainbow_colors: [[255, 0, 0], [255, 140, 0], [255, 255, 0], [0, 200, 0], [0, 100, 255], [140, 0, 255]],
+            rainbow_pattern: "wave",
+            rainbow_speed: 5
         };
 
         function fetchState() {
@@ -187,6 +227,10 @@ HTML_TEMPLATE = """
                 .then(data => {
                     state = data;
                     document.getElementById('brightness').value = state.brightness;
+                    document.getElementById('brightnessValue').textContent = state.brightness;
+                    document.getElementById('rainbowPattern').value = state.rainbow_pattern;
+                    document.getElementById('rainbowSpeed').value = state.rainbow_speed;
+                    document.getElementById('rainbowSpeedValue').textContent = state.rainbow_speed;
                     
                     const rgbToHex = (r, g, b) => '#' + [r, g, b].map(x => {
                         const hex = x.toString(16);
@@ -201,13 +245,34 @@ HTML_TEMPLATE = """
         function updateUI() {
             document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
             document.getElementById('btn_' + state.mode).classList.add('active');
-            
+
+            // Make the actual current on/off state obvious: highlight
+            // whichever button matches it, rather than the two buttons
+            // just always looking different from each other regardless
+            // of the real state.
+            document.getElementById('btn_power_on').classList.toggle('active-on', state.is_on);
+            document.getElementById('btn_power_off').classList.toggle('active-off', !state.is_on);
+
             const ul = document.getElementById('ticker-list');
             ul.innerHTML = '';
             state.tickers.forEach((t, i) => {
                 let li = document.createElement('li');
                 li.innerHTML = `<span>${t}</span> <button onclick="removeTicker(${i})" style="padding: 2px 5px; background: #dc3545;">X</button>`;
                 ul.appendChild(li);
+            });
+
+            const rgbToHex = (r, g, b) => '#' + [r, g, b].map(x => {
+                const hex = x.toString(16);
+                return hex.length === 1 ? '0' + hex : hex;
+            }).join('');
+
+            const rl = document.getElementById('rainbow-color-list');
+            rl.innerHTML = '';
+            state.rainbow_colors.forEach((c, i) => {
+                let li = document.createElement('li');
+                li.innerHTML = `<span style="display:inline-block; width:20px; height:20px; background:${rgbToHex(c[0],c[1],c[2])}; border-radius:3px; vertical-align:middle; margin-right:8px;"></span>` +
+                    `<button onclick="removeRainbowColor(${i})" style="padding: 2px 5px; background: #dc3545;">X</button>`;
+                rl.appendChild(li);
             });
         }
 
@@ -228,6 +293,14 @@ HTML_TEMPLATE = """
         function setMode(mode) {
             state.mode = mode;
             pushState();
+        }
+
+        function stepBrightness(delta) {
+            const slider = document.getElementById('brightness');
+            const newVal = Math.max(0, Math.min(255, parseInt(slider.value) + delta));
+            slider.value = newVal;
+            document.getElementById('brightnessValue').textContent = newVal;
+            updateState();
         }
 
         function updateState() {
@@ -255,6 +328,28 @@ HTML_TEMPLATE = """
             pushState();
         }
 
+        function addRainbowColor() {
+            const hex = document.getElementById('newRainbowColor').value;
+            state.rainbow_colors.push([
+                parseInt(hex.slice(1, 3), 16),
+                parseInt(hex.slice(3, 5), 16),
+                parseInt(hex.slice(5, 7), 16)
+            ]);
+            pushState();
+        }
+
+        function removeRainbowColor(index) {
+            if (state.rainbow_colors.length <= 1) return; // always keep at least one color
+            state.rainbow_colors.splice(index, 1);
+            pushState();
+        }
+
+        function updateRainbowSettings() {
+            state.rainbow_pattern = document.getElementById('rainbowPattern').value;
+            state.rainbow_speed = parseInt(document.getElementById('rainbowSpeed').value);
+            pushState();
+        }
+
         fetchState();
     </script>
 </body>
@@ -269,7 +364,27 @@ def index():
 def handle_state():
     global state
     if request.method == 'POST':
-        data = request.json
+        data = request.json or {}
+
+        if 'rainbow_speed' in data:
+            try:
+                data['rainbow_speed'] = max(1, min(int(data['rainbow_speed']), 10))
+            except (TypeError, ValueError):
+                data.pop('rainbow_speed', None)
+
+        if 'rainbow_pattern' in data and data['rainbow_pattern'] not in ('wave', 'cycle'):
+            data.pop('rainbow_pattern', None)
+
+        if 'rainbow_colors' in data:
+            try:
+                cleaned = []
+                for c in data['rainbow_colors']:
+                    r, g, b = c
+                    cleaned.append([max(0, min(int(r), 255)), max(0, min(int(g), 255)), max(0, min(int(b), 255))])
+                data['rainbow_colors'] = cleaned if cleaned else state['rainbow_colors']
+            except (TypeError, ValueError):
+                data.pop('rainbow_colors', None)
+
         state.update(data)
         return jsonify({"status": "success"})
     return jsonify(state)
@@ -349,6 +464,14 @@ def get_weather():
         try:
             res = requests.get(url, headers=headers, timeout=8).json()
 
+            if "current_weather" not in res:
+                # Open-Meteo returns a normal 200 with an {"error": true,
+                # "reason": "..."} body for bad requests/rate limiting,
+                # rather than an HTTP error code - so a KeyError here is
+                # usually the API telling us something, not a code bug.
+                # Print the raw body so a repeat failure is diagnosable.
+                raise KeyError(f"'current_weather' missing from response: {res}")
+
             current_temp = round(res["current_weather"]["temperature"])
             weathercode = res["current_weather"]["weathercode"]
             low_temp = round(res["daily"]["temperature_2m_min"][0])
@@ -371,12 +494,19 @@ def draw_weather_icon(draw, x, y, category):
     color = WEATHER_ICON_COLORS.get(category, (200, 200, 200))
 
     if category == "sunny":
+        # A solid circular sun with 8 rays (cardinal + diagonal) clearly
+        # radiating outward, rather than a small blob that could be
+        # mistaken for anything else.
         cx, cy, r = x + 5, y + 5, 3
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
-        draw.line([cx, y, cx, y + 1], fill=color)
-        draw.line([cx, y + 9, cx, y + 10], fill=color)
-        draw.line([x, cy, x + 1, cy], fill=color)
-        draw.line([x + 9, cy, x + 10, cy], fill=color)
+        draw.line([cx, y, cx, y + 1], fill=color)              # N
+        draw.line([cx, y + 9, cx, y + 10], fill=color)          # S
+        draw.line([x, cy, x + 1, cy], fill=color)                # W
+        draw.line([x + 9, cy, x + 10, cy], fill=color)          # E
+        draw.line([x + 1, y + 1, x + 2, y + 2], fill=color)      # NW
+        draw.line([x + 9, y + 1, x + 8, y + 2], fill=color)      # NE
+        draw.line([x + 1, y + 9, x + 2, y + 8], fill=color)      # SW
+        draw.line([x + 9, y + 9, x + 8, y + 8], fill=color)      # SE
 
     elif category == "cloudy":
         draw.ellipse([x, y + 3, x + 6, y + 9], fill=color)
@@ -384,32 +514,90 @@ def draw_weather_icon(draw, x, y, category):
         draw.rectangle([x + 2, y + 7, x + 10, y + 9], fill=color)
 
     elif category == "rain":
-        draw.ellipse([x, y, x + 6, y + 6], fill=color)
-        draw.ellipse([x + 4, y - 2, x + 11, y + 6], fill=color)
-        draw.rectangle([x + 2, y + 4, x + 10, y + 6], fill=color)
-        draw.line([x + 2, y + 8, x + 1, y + 10], fill=color)
-        draw.line([x + 6, y + 8, x + 5, y + 10], fill=color)
-        draw.line([x + 9, y + 8, x + 8, y + 10], fill=color)
+        # A single raindrop/teardrop shape - pointed top, rounded bottom -
+        # with no cloud above it.
+        cx = x + 5
+        draw.polygon([(cx, y), (x + 1, y + 6), (x + 9, y + 6)], fill=color)
+        draw.ellipse([x, y + 3, x + 10, y + 10], fill=color)
 
-    else:  # snow
-        draw.ellipse([x, y, x + 6, y + 6], fill=color)
-        draw.ellipse([x + 4, y - 2, x + 11, y + 6], fill=color)
-        draw.rectangle([x + 2, y + 4, x + 10, y + 6], fill=color)
-        draw.point([(x + 2, y + 9), (x + 6, y + 10), (x + 9, y + 9)], fill=color)
+    else:  # snow - a 4-line (8-point) snowflake, no cloud
+        cx, cy = x + 5, y + 5
+        draw.line([cx, y, cx, y + 10], fill=color)                  # vertical
+        draw.line([x, cy, x + 10, cy], fill=color)                  # horizontal
+        draw.line([x + 1, y + 1, x + 9, y + 9], fill=color)         # diagonal \
+        draw.line([x + 1, y + 9, x + 9, y + 1], fill=color)         # diagonal /
+        # short branch ticks near each arm's tip for a more snowflake-like look
+        draw.point([(cx - 1, y + 2), (cx + 1, y + 2), (cx - 1, y + 8), (cx + 1, y + 8)], fill=color)
+        draw.point([(x + 2, cy - 1), (x + 2, cy + 1), (x + 8, cy - 1), (x + 8, cy + 1)], fill=color)
+
+
+# yfinance talks to Yahoo's unofficial endpoints, which are increasingly
+# strict about traffic that doesn't look like a real browser. Reusing one
+# session with a normal User-Agent significantly cuts down on 429 "Too Many
+# Requests" / empty-dataframe responses compared to yfinance's bare default.
+_yf_session = requests.Session()
+_yf_session.headers.update({"User-Agent": "Mozilla/5.0 (LED-Matrix-Display/1.0)"})
 
 
 def get_stock_data(ticker):
-    """ Fetch 1 day of historical data for graphing """
+    """ Fetch intraday data for graphing, with fallbacks for when the
+    market is closed (weekends/holidays) or Yahoo briefly rate-limits us.
+    Returns (current_price, price_history) or (None, None) if every
+    attempt fails.
+    """
+    attempts = [
+        ("1d", "5m"),
+        ("5d", "15m"),   # falls back across the weekend / after-hours
+    ]
+
+    for period, interval in attempts:
+        for attempt in range(2):
+            try:
+                tick = yf.Ticker(ticker, session=_yf_session)
+                hist = tick.history(period=period, interval=interval)
+                if hist.empty:
+                    raise ValueError(f"empty history for period={period} interval={interval}")
+
+                current_price = round(hist['Close'].iloc[-1], 2)
+                prices = hist['Close'].tolist()
+                return current_price, prices
+            except Exception as e:
+                print(f"[get_stock_data:{ticker}] {period}/{interval} attempt {attempt + 1}/2 failed: {e}")
+                traceback.print_exc()
+                time.sleep(1)
+
+    # Last resort: try to at least get a live price even with no history,
+    # so the ticker isn't showing "NODATA" purely because history failed.
     try:
-        tick = yf.Ticker(ticker)
-        hist = tick.history(period="1d", interval="5m")
-        if hist.empty:
-            return None, None
-        current_price = round(hist['Close'].iloc[-1], 2)
-        prices = hist['Close'].tolist()
-        return current_price, prices
-    except:
-        return None, None
+        tick = yf.Ticker(ticker, session=_yf_session)
+        price = tick.fast_info.get("lastPrice")
+        if price:
+            return round(price, 2), None
+    except Exception as e:
+        print(f"[get_stock_data:{ticker}] fast_info fallback failed: {e}")
+        traceback.print_exc()
+
+    return None, None
+
+def interpolate_rainbow(colors, t):
+    """ Given a list of [r,g,b] colors and a position t in [0,1) that wraps
+    around the whole list, returns a smoothly blended (r,g,b) between
+    whichever two colors t falls between. This is what lets the rainbow
+    mode "scroll" or "cycle" smoothly rather than hard-cutting between
+    colors. """
+    n = len(colors)
+    if n == 0:
+        return (0, 0, 0)
+    if n == 1:
+        return tuple(colors[0])
+
+    t = t % 1.0
+    scaled = t * n
+    i = int(scaled) % n
+    frac = scaled - int(scaled)
+    c1, c2 = colors[i], colors[(i + 1) % n]
+    return tuple(int(c1[k] + (c2[k] - c1[k]) * frac) for k in range(3))
+
 
 # --- 6. MAIN LED THREAD LOOP ---
 def led_controller():
@@ -419,112 +607,170 @@ def led_controller():
     current_ticker_idx = 0
     loop_counter = 0
     cached_weather = None
+    rainbow_offset = 0.0
 
     while True:
-        strip.setBrightness(state["brightness"])
+        try:
+            strip.setBrightness(state["brightness"])
 
-        if not state["is_on"]:
-            for i in range(strip.numPixels()):
-                strip.setPixelColor(i, Color(0, 0, 0))
-            strip.show()
-            time.sleep(0.5)
-            continue
-
-        # --- MODE 1: LIGHT PANEL ---
-        if state["mode"] == "light_panel":
-            r, g, b = state["color"]
-            color = Color(r, g, b)
-            for i in range(strip.numPixels()):
-                strip.setPixelColor(i, color)
-            strip.show()
-            time.sleep(0.5)
-
-        # --- MODE 2: TIME & WEATHER ---
-        elif state["mode"] == "time_weather":
-            img = Image.new('RGB', (ledWidth, ledHeight), color=(0, 0, 0))
-            draw = ImageDraw.Draw(img)
-
-            if loop_counter % 50 == 0:
-                cached_weather = get_weather()
-                print(f"Weather data captured: {cached_weather}")
-
-            tz = pytz.timezone('America/Vancouver')
-            now = datetime.now(tz)
-            time_val = now.strftime("%I:%M").lstrip('0')
-            am_pm = now.strftime("%p")
-
-            # Line 1 (y=0): time and AM/PM together
-            draw_custom_text(img, f"{time_val} {am_pm}", 1, 0, (255, 255, 255))
-
-            if cached_weather is not None:
-                current_temp, low_temp, high_temp, category = cached_weather
-
-                # Line 2 (y=11): current temperature + a color-coded icon
-                # for the current condition (sunny/rain/cloudy/snow)
-                temp_str = f"{current_temp}C"
-                draw_custom_text(img, temp_str, 1, 11, (255, 255, 255))
-                icon_x = 1 + len(temp_str) * 5 + 3
-                draw_weather_icon(draw, icon_x, 11, category)
-
-                # Line 3 (y=22): today's temperature range
-                range_str = f"{low_temp}-{high_temp}C"
-                draw_custom_text(img, range_str, 1, 22, (0, 200, 255))
-            else:
-                draw_custom_text(img, "NO DATA", 1, 11, (255, 0, 0))
-
-            display_image_on_matrix(strip, img)
-            time.sleep(1)
-            loop_counter += 1
-
-        # --- MODE 3: STOCK TRADING ---
-        elif state["mode"] == "stock_trading":
-            if not state["tickers"]:
-                time.sleep(1)
+            if not state["is_on"]:
+                for i in range(strip.numPixels()):
+                    strip.setPixelColor(i, Color(0, 0, 0))
+                strip.show()
+                time.sleep(0.5)
                 continue
 
-            ticker = state["tickers"][current_ticker_idx]
-            price, history = get_stock_data(ticker)
+            # --- MODE 1: LIGHT PANEL ---
+            if state["mode"] == "light_panel":
+                r, g, b = state["color"]
+                color = Color(r, g, b)
+                for i in range(strip.numPixels()):
+                    strip.setPixelColor(i, color)
+                strip.show()
+                time.sleep(0.5)
 
-            img = Image.new('RGB', (ledWidth, ledHeight), color=(0, 0, 0))
-            draw = ImageDraw.Draw(img) # Draw is still used exclusively for the graph line
+            # --- MODE 2: TIME & WEATHER ---
+            elif state["mode"] == "time_weather":
+                img = Image.new('RGB', (ledWidth, ledHeight), color=(0, 0, 0))
+                draw = ImageDraw.Draw(img)
 
-            if price is not None:
-                if price >= 1000:
-                    price_str = f"{price:.0f}"
+                if loop_counter % 60 == 0:
+                    cached_weather = get_weather()
+                    print(f"Weather data captured: {cached_weather}")
+
+                tz = pytz.timezone('America/Vancouver')
+                now = datetime.now(tz)
+                time_val = now.strftime("%I:%M").lstrip('0')
+                am_pm = now.strftime("%p")
+
+                # Line 1 (y=0): time and AM/PM together
+                draw_custom_text(img, f"{time_val} {am_pm}", 1, 0, (255, 255, 255))
+
+                if cached_weather is not None:
+                    current_temp, low_temp, high_temp, category = cached_weather
+
+                    # Line 2 (y=11): current temperature + a color-coded icon
+                    # for the current condition (sunny/rain/cloudy/snow)
+                    temp_str = f"{current_temp}C"
+                    draw_custom_text(img, temp_str, 1, 11, (255, 255, 255))
+                    icon_x = 1 + len(temp_str) * 5 + 3
+                    draw_weather_icon(draw, icon_x, 11, category)
+
+                    # Line 3 (y=22): today's temperature range
+                    range_str = f"{low_temp}-{high_temp}C"
+                    draw_custom_text(img, range_str, 1, 22, (0, 200, 255))
                 else:
-                    price_str = f"{price:.2f}"
-                price_str = price_str[:6]
+                    draw_custom_text(img, "NO DATA", 1, 11, (255, 0, 0))
 
-                # Using custom font mapping for text
-                draw_custom_text(img, ticker[:6], 1, 0, (255, 255, 0))
-                draw_custom_text(img, price_str, 1, 11, (255, 255, 255))
+                display_image_on_matrix(strip, img)
+                time.sleep(1)
+                loop_counter += 1
 
-                # Shifted the mini line graph downward (rows 22 to 31) so it doesn't overlap text
-                if history and len(history) > 1:
-                    min_p, max_p = min(history), max(history)
-                    diff = max_p - min_p if max_p - min_p != 0 else 1
-                    
-                    points = []
-                    step = max(1, len(history) // 40)
-                    sampled = history[::step][:40] 
-                    
-                    for x, p in enumerate(sampled):
-                        normalized_y = 31 - int(((p - min_p) / diff) * 9)
-                        points.append((x, normalized_y))
-                    
-                    if len(points) > 1:
-                        graph_color = (0, 255, 0) if history[-1] >= history[0] else (255, 0, 0)
-                        draw.line(points, fill=graph_color, width=1)
-            else:
-                draw_custom_text(img, "NODATA", 1, 11, (255, 0, 0))
+            # --- MODE 3: STOCK TRADING ---
+            elif state["mode"] == "stock_trading":
+                if not state["tickers"]:
+                    time.sleep(1)
+                    continue
 
-            display_image_on_matrix(strip, img)
-            time.sleep(5)
-            current_ticker_idx = (current_ticker_idx + 1) % len(state["tickers"])
+                ticker = state["tickers"][current_ticker_idx]
+                price, history = get_stock_data(ticker)
+
+                img = Image.new('RGB', (ledWidth, ledHeight), color=(0, 0, 0))
+                draw = ImageDraw.Draw(img) # Draw is still used exclusively for the graph line
+
+                if price is not None:
+                    if price >= 1000:
+                        price_str = f"{price:.0f}"
+                    else:
+                        price_str = f"{price:.2f}"
+                    price_str = price_str[:6]
+
+                    # Using custom font mapping for text
+                    draw_custom_text(img, ticker[:6], 1, 0, (255, 255, 0))
+                    draw_custom_text(img, price_str, 1, 11, (255, 255, 255))
+
+                    # Shifted the mini line graph downward (rows 22 to 31) so it doesn't overlap text
+                    if history and len(history) > 1:
+                        min_p, max_p = min(history), max(history)
+                        diff = max_p - min_p if max_p - min_p != 0 else 1
+                    
+                        points = []
+                        step = max(1, len(history) // 40)
+                        sampled = history[::step][:40] 
+                    
+                        for x, p in enumerate(sampled):
+                            normalized_y = 31 - int(((p - min_p) / diff) * 9)
+                            points.append((x, normalized_y))
+                    
+                        if len(points) > 1:
+                            graph_color = (0, 255, 0) if history[-1] >= history[0] else (255, 0, 0)
+                            draw.line(points, fill=graph_color, width=1)
+                else:
+                    draw_custom_text(img, "NODATA", 1, 11, (255, 0, 0))
+
+                display_image_on_matrix(strip, img)
+                time.sleep(5)
+                current_ticker_idx = (current_ticker_idx + 1) % len(state["tickers"])
+
+            # --- MODE 4: RAINBOW ---
+            elif state["mode"] == "rainbow":
+                colors = state.get("rainbow_colors") or [[255, 0, 0]]
+                pattern = state.get("rainbow_pattern", "wave")
+                speed = max(1, min(int(state.get("rainbow_speed", 5)), 10))
+
+                img = Image.new('RGB', (ledWidth, ledHeight), color=(0, 0, 0))
+
+                if pattern == "cycle":
+                    # Whole panel is one color at a time, smoothly fading
+                    # to the next color in the user's list.
+                    color = interpolate_rainbow(colors, rainbow_offset)
+                    for x in range(ledWidth):
+                        for y in range(ledHeight):
+                            img.putpixel((x, y), color)
+                else:
+                    # "wave": each column gets a color based on its position
+                    # plus the current time offset, so the whole list of
+                    # colors visibly scrolls left-to-right across the panel.
+                    for x in range(ledWidth):
+                        t = (x / ledWidth) + rainbow_offset
+                        color = interpolate_rainbow(colors, t)
+                        for y in range(ledHeight):
+                            img.putpixel((x, y), color)
+
+                display_image_on_matrix(strip, img)
+                # `speed` (1-10) is the user-facing "frequency" control -
+                # higher speed advances the offset further per frame, so
+                # the scroll/fade moves faster.
+                rainbow_offset = (rainbow_offset + speed / 400.0) % 1.0
+                time.sleep(0.05)
+
+        except Exception as e:
+            # A bug in any single mode (bad data, a display glitch,
+            # etc.) should never be able to permanently freeze the
+            # whole board the way the missing `traceback` import did
+            # previously - log it and keep the loop alive instead.
+            print(f"[led_controller] frame error: {e}")
+            traceback.print_exc()
+            time.sleep(1)
+
 
 if __name__ == '__main__':
+    # NOTE: Flask's debug reloader re-executes this whole script in a second
+    # ("monitor") process to watch for code changes. Since led_thread.start()
+    # runs unconditionally at the top level, debug=True previously caused
+    # TWO independent led_controller threads - one per process, each with
+    # its own default `state` - to write to the same physical LED strip at
+    # once. That's what caused the periodic flash back to Time & Weather:
+    # the monitor process's thread never received your mode changes (they
+    # only reached the real worker process's `state`), so it kept redrawing
+    # its own stale time_weather frame over whatever the real process had
+    # just set.
+    #
+    # Code that drives physical hardware should never run twice like this,
+    # so both debug mode and the reloader are disabled outright rather than
+    # just worked around.
     led_thread = threading.Thread(target=led_controller, daemon=True)
     led_thread.start()
 
     print("Starting WebUI. Access via http://<Raspberry-Pi-IP-Address>:8080")
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
